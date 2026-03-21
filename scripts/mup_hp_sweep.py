@@ -364,6 +364,7 @@ def train_model(width: int, config: SweepConfig, device: torch.device,
     del model, optimizer
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    torch._dynamo.reset()
 
     return losses, actual_width
 

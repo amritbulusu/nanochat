@@ -1079,6 +1079,10 @@ def main():
                         help='Base width for muP (default: 256)')
     parser.add_argument('--compare', action='store_true', default=False,
                         help='Run both SP and muP')
+    parser.add_argument('--lr-values', type=str, default=None,
+                        help='Comma-separated LR values (overrides default grid)')
+    parser.add_argument('--wd-values', type=str, default=None,
+                        help='Comma-separated WD values (overrides default grid)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
     parser.add_argument('--target-param-data-ratio', type=float, default=10.5,
@@ -1164,9 +1168,13 @@ def main():
 
     # ── 2D sweep ───────────────────────────────────────────────────────────
 
+    # Parse custom sweep values if provided
+    custom_lr = [float(x) for x in args.lr_values.split(',')] if args.lr_values else None
+    custom_wd = [float(x) for x in args.wd_values.split(',')] if args.wd_values else None
+
     if args.sweep_2d:
-        lr_values = DEFAULT_LR_VALUES
-        wd_values = DEFAULT_WD_VALUES
+        lr_values = custom_lr or DEFAULT_LR_VALUES
+        wd_values = custom_wd or DEFAULT_WD_VALUES
 
         if args.compare:
             # SP
@@ -1217,8 +1225,8 @@ def main():
     # ── 1D sweeps ──────────────────────────────────────────────────────────
 
     sweep_1d_configs = [
-        ('sweep_lr',          'lr',          DEFAULT_LR_VALUES),
-        ('sweep_wd',          'wd',          DEFAULT_WD_VALUES),
+        ('sweep_lr',          'lr',          custom_lr or DEFAULT_LR_VALUES),
+        ('sweep_wd',          'wd',          custom_wd or DEFAULT_WD_VALUES),
         ('sweep_init_scale',  'init_scale',  DEFAULT_INIT_SCALE_VALUES),
         ('sweep_attn_temp',   'attn_temp',   DEFAULT_ATTN_TEMP_VALUES),
         ('sweep_emb_mult',    'emb_mult',    DEFAULT_EMB_MULT_VALUES),

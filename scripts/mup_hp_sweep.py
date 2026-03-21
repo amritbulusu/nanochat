@@ -1090,8 +1090,8 @@ def main():
                         help='Fraction of steps for LR warmdown (default: 0.65)')
     parser.add_argument('--final-lr-frac', type=float, default=0.05,
                         help='Final LR as fraction of peak (default: 0.05)')
-    parser.add_argument('--grad-accum-steps', type=int, default=1,
-                        help='Gradient accumulation steps (default: 1)')
+    parser.add_argument('--grad-accum-steps', type=int, default=0,
+                        help='Gradient accumulation steps (0 = auto-compute from scaling laws)')
 
     # Output
     parser.add_argument('--save-dir', type=str, default=None,
@@ -1148,7 +1148,12 @@ def main():
 
     # Compute batch/depth scaling (matching base_train.py scaling laws)
     batch_lr_scale, weight_decay_scaled, total_batch_size, num_iterations, grad_accum = compute_scaling(base_config)
-    base_config.grad_accum_steps = grad_accum
+    # Respect explicit CLI override; otherwise use auto-computed value
+    if args.grad_accum_steps > 0:
+        base_config.grad_accum_steps = args.grad_accum_steps
+        print(f"Using CLI grad_accum_steps={args.grad_accum_steps} (auto-computed was {grad_accum})")
+    else:
+        base_config.grad_accum_steps = grad_accum
     print(f"\nProduction-matching setup:")
     print(f"  depth={base_config.n_layer}, base_width={base_config.base_width}, "
           f"seq_len={base_config.seq_len}, batch_size={base_config.batch_size}")

@@ -40,6 +40,10 @@ class GPTConfig:
     # muP (Maximal Update Parametrization): set > 0 to enable. Value is the base/proxy width.
     # Enables: non-zero c_proj init scaled as 1/sqrt(m_d), output logit scaling by base_width/n_embd.
     mup_base_width: int = 0
+    # Sweepable hyperparameters (defaults reproduce current behavior exactly)
+    attn_temp: float = 1.44     # QK scaling temperature (currently 1.2*1.2=1.44 split between Q and K)
+    emb_mult: float = 1.0       # scalar after embedding norm (before transformer blocks)
+    output_temp: float = 1.0    # scalar on logits before softcap
 
 
 def norm(x):
@@ -79,6 +83,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.attn_temp_sqrt = config.attn_temp ** 0.5
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -101,8 +106,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
+        q = q * self.attn_temp_sqrt  # sharper attention (split scale between Q and K)
+        k = k * self.attn_temp_sqrt
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -462,6 +467,8 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
+        if self.config.emb_mult != 1.0:
+            x = x * self.config.emb_mult
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
@@ -506,6 +513,8 @@ class GPT(nn.Module):
             # Without this, logits grow with width because the lm_head dot product sums over n_embd terms.
             # 1/sqrt(m_d) only corrects at init; 1/m_d is required for all training steps (see Eleuther blog Fig 8-9).
             logits = logits * (self.config.mup_base_width / self.config.n_embd)
+        if self.config.output_temp != 1.0:
+            logits = logits * self.config.output_temp
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits

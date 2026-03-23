@@ -1098,6 +1098,11 @@ def main():
     parser.add_argument('--grad-accum-steps', type=int, default=0,
                         help='Gradient accumulation steps (0 = auto-compute from scaling laws)')
 
+    # Parallelism (for multi-GPU: split work across processes)
+    parser.add_argument('--shard', type=str, default=None,
+                        help='Shard index/total, e.g. "0/8" runs 1st of 8 shards. '
+                             'Splits the outer sweep loop (LR values for 2D, HP values for 1D)')
+
     # Output
     parser.add_argument('--save-dir', type=str, default=None,
                         help='Directory to save plots + JSON results')
@@ -1207,8 +1212,21 @@ def main():
     custom_lr = [float(x) for x in args.lr_values.split(',')] if args.lr_values else None
     custom_wd = [float(x) for x in args.wd_values.split(',')] if args.wd_values else None
 
+    # Sharding: split work across multiple processes (one per GPU)
+    def shard_values(values):
+        if args.shard is None:
+            return values
+        shard_idx, shard_total = [int(x) for x in args.shard.split('/')]
+        chunk_size = max(1, (len(values) + shard_total - 1) // shard_total)
+        start = shard_idx * chunk_size
+        end = min(start + chunk_size, len(values))
+        sharded = values[start:end]
+        print(f"Shard {shard_idx}/{shard_total}: processing {len(sharded)}/{len(values)} values: {sharded}")
+        return sharded
+
     if args.sweep_2d:
         lr_values = custom_lr or DEFAULT_LR_VALUES
+        lr_values = shard_values(lr_values)
         wd_values = custom_wd or DEFAULT_WD_VALUES
 
         if args.compare:
@@ -1272,6 +1290,7 @@ def main():
     for flag_name, hp_name, hp_values in sweep_1d_configs:
         if not getattr(args, flag_name):
             continue
+        hp_values = shard_values(hp_values)
 
         if args.compare:
             # SP

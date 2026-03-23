@@ -1157,12 +1157,46 @@ def main():
     if args.grad_accum_steps > 0:
         base_config.grad_accum_steps = args.grad_accum_steps
         print(f"Using CLI grad_accum_steps={args.grad_accum_steps} (auto-computed was {grad_accum})")
+        # Recompute batch_lr_scale and weight_decay_scaled for the actual batch size
+        actual_total_batch = args.grad_accum_steps * base_config.batch_size * base_config.seq_len
+        B_REF = 2**19  # 524288, matching base_train.py
+        batch_lr_scale = (actual_total_batch / B_REF) ** 0.5
+        # Recompute WD scaling with actual batch
+        d12_ref = None
+        with torch.device('meta'):
+            base_dim = 12 * base_config.aspect_ratio
+            model_dim = ((base_dim + base_config.head_dim - 1) // base_config.head_dim) * base_config.head_dim
+            n_head = model_dim // base_config.head_dim
+            d12_ref = GPT(GPTConfig(
+                sequence_len=base_config.seq_len, vocab_size=base_config.vocab_size,
+                n_layer=12, n_head=n_head, n_kv_head=n_head, n_embd=model_dim,
+                window_pattern=base_config.window_pattern,
+            ))
+        pc = d12_ref.num_scaling_params()
+        D_REF = base_config.target_param_data_ratio * (pc['transformer_matrices'] + pc['lm_head'])
+        # Target tokens for our proxy model
+        proxy_ref = None
+        with torch.device('meta'):
+            base_dim = base_config.base_width
+            model_dim = ((base_dim + base_config.head_dim - 1) // base_config.head_dim) * base_config.head_dim
+            n_head_p = model_dim // base_config.head_dim
+            proxy_ref = GPT(GPTConfig(
+                sequence_len=base_config.seq_len, vocab_size=base_config.vocab_size,
+                n_layer=base_config.n_layer, n_head=n_head_p, n_kv_head=n_head_p, n_embd=model_dim,
+                window_pattern=base_config.window_pattern,
+            ))
+        pc2 = proxy_ref.num_scaling_params()
+        target_tokens = int(base_config.target_param_data_ratio * (pc2['transformer_matrices'] + pc2['lm_head']))
+        weight_decay_scaled = base_config.weight_decay * math.sqrt(actual_total_batch / B_REF) * (D_REF / target_tokens)
+        total_batch_size = actual_total_batch
+        print(f"Recomputed for actual batch: batch_lr_scale={batch_lr_scale:.4f}, "
+              f"weight_decay_scaled={weight_decay_scaled:.6f}, total_batch={actual_total_batch:,}")
     else:
         base_config.grad_accum_steps = grad_accum
     print(f"\nProduction-matching setup:")
     print(f"  depth={base_config.n_layer}, base_width={base_config.base_width}, "
           f"seq_len={base_config.seq_len}, batch_size={base_config.batch_size}")
-    print(f"  total_batch_size={total_batch_size:,} tokens, grad_accum={grad_accum}, "
+    print(f"  total_batch_size={total_batch_size:,} tokens, grad_accum={base_config.grad_accum_steps}, "
           f"num_iterations={num_iterations:,}")
     print(f"  batch_lr_scale={batch_lr_scale:.4f}, weight_decay_scaled={weight_decay_scaled:.6f}")
     print(f"  steps_per_sweep_run={base_config.steps} (truncated training for HP search)")

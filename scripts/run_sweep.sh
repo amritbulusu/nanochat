@@ -10,16 +10,16 @@ apt-get update && apt-get install -y python3-dev
 python -m nanochat.dataset -n 2
 python -m scripts.tok_train
 
-# Launch 5 shards on 5 GPUs (5 LR values, 1 per GPU)
-for i in 0 1 2 3 4; do
+# Launch 8 shards on 8 GPUs (8 LR values, 1 per GPU)
+for i in 0 1 2 3 4 5 6 7; do
     CUDA_VISIBLE_DEVICES=$i python -m scripts.mup_hp_sweep \
         --sweep-2d \
         --widths 256 \
-        --lr-values 0.005,0.01,0.02,0.03,0.05 \
+        --lr-values 0.003,0.005,0.007,0.01,0.015,0.02,0.03,0.05\
         --wd-values 0.0,0.1,0.2,0.3,0.4,0.6 \
-        --batch-size 32 \
-        --grad-accum-steps 8 \
-        --shard $i/5 \
+        --batch-size 16 \
+        --grad-accum-steps 16 \
+        --shard $i/8 \
         --save-dir /tmp/sweep_shard_$i \
         --no-plot &
 done

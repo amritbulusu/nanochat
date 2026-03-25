@@ -40,6 +40,10 @@ class GPTConfig:
     # muP (Maximal Update Parametrization): set > 0 to enable. Value is the base/proxy width.
     # Enables: non-zero c_proj init scaled as 1/sqrt(m_d), output logit scaling by base_width/n_embd.
     mup_base_width: int = 0
+    # Sweepable hyperparameters (defaults reproduce current behavior exactly)
+    attn_temp: float = 1.44     # QK scaling temperature (currently 1.2*1.2=1.44 split between Q and K)
+    emb_mult: float = 1.0       # scalar after embedding norm (before transformer blocks)
+    output_temp: float = 1.0    # scalar on logits before softcap
 
 
 def norm(x):
@@ -79,6 +83,7 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.attn_temp_sqrt = config.attn_temp ** 0.5
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -101,8 +106,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
-        q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
-        k = k * 1.2
+        q = q * self.attn_temp_sqrt  # sharper attention (split scale between Q and K)
+        k = k * self.attn_temp_sqrt
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -410,16 +415,18 @@ class GPT(nn.Module):
             emb_lr_scale = 1.0        # Embeddings: NO width scaling (standard muP)
             hidden_lr_scale = width_ratio ** muon_lr_exponent  # Hidden (Muon): default 0 = no scaling
             output_lr_scale = 1.0     # Output (AdamW): NO LR scaling (logit scaling in forward suffices)
+            ve_lr_scale = 1.0        # VEs: NO width scaling (ablation showed 1/m_d hurts transfer)
             assert self.config.mup_base_width == base_width, \
                 f"mup_base_width mismatch: GPTConfig has {self.config.mup_base_width}, but setup_optimizer got base_width={base_width}. " \
                 f"Set mup_base_width={base_width} in GPTConfig at construction time."
-            print0(f"muP scaling: base_width={base_width}, model_dim={model_dim}, width_ratio={width_ratio:.6f}, muon_lr_exp={muon_lr_exponent}")
+            print0(f"muP scaling: base_width={base_width}, model_dim={model_dim}, width_ratio={width_ratio:.6f}, muon_lr_exp={muon_lr_exponent}, ve_lr_scale={ve_lr_scale:.6f}")
         else:
             # Standard (SP): scale AdamW params by 1/√dmodel (tuned for 768 dim model)
             dmodel_lr_scale = (model_dim / 768) ** -0.5
             emb_lr_scale = dmodel_lr_scale
             hidden_lr_scale = 1.0  # Muon params: no scaling in SP mode
             output_lr_scale = dmodel_lr_scale
+            ve_lr_scale = emb_lr_scale  # SP: same as other embeddings
             print0(f"Standard scaling: dmodel_lr_scale={dmodel_lr_scale:.6f}")
 
         # Build param_groups with all required fields explicit
@@ -428,7 +435,7 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * output_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * emb_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * emb_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * ve_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
@@ -462,6 +469,8 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
+        if self.config.emb_mult != 1.0:
+            x = x * self.config.emb_mult
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
@@ -506,6 +515,8 @@ class GPT(nn.Module):
             # Without this, logits grow with width because the lm_head dot product sums over n_embd terms.
             # 1/sqrt(m_d) only corrects at init; 1/m_d is required for all training steps (see Eleuther blog Fig 8-9).
             logits = logits * (self.config.mup_base_width / self.config.n_embd)
+        if self.config.output_temp != 1.0:
+            logits = logits * self.config.output_temp
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits

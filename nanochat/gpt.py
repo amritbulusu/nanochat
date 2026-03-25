@@ -415,16 +415,18 @@ class GPT(nn.Module):
             emb_lr_scale = 1.0        # Embeddings: NO width scaling (standard muP)
             hidden_lr_scale = width_ratio ** muon_lr_exponent  # Hidden (Muon): default 0 = no scaling
             output_lr_scale = 1.0     # Output (AdamW): NO LR scaling (logit scaling in forward suffices)
+            ve_lr_scale = 1.0        # VEs: NO width scaling (ablation showed 1/m_d hurts transfer)
             assert self.config.mup_base_width == base_width, \
                 f"mup_base_width mismatch: GPTConfig has {self.config.mup_base_width}, but setup_optimizer got base_width={base_width}. " \
                 f"Set mup_base_width={base_width} in GPTConfig at construction time."
-            print0(f"muP scaling: base_width={base_width}, model_dim={model_dim}, width_ratio={width_ratio:.6f}, muon_lr_exp={muon_lr_exponent}")
+            print0(f"muP scaling: base_width={base_width}, model_dim={model_dim}, width_ratio={width_ratio:.6f}, muon_lr_exp={muon_lr_exponent}, ve_lr_scale={ve_lr_scale:.6f}")
         else:
             # Standard (SP): scale AdamW params by 1/√dmodel (tuned for 768 dim model)
             dmodel_lr_scale = (model_dim / 768) ** -0.5
             emb_lr_scale = dmodel_lr_scale
             hidden_lr_scale = 1.0  # Muon params: no scaling in SP mode
             output_lr_scale = dmodel_lr_scale
+            ve_lr_scale = emb_lr_scale  # SP: same as other embeddings
             print0(f"Standard scaling: dmodel_lr_scale={dmodel_lr_scale:.6f}")
 
         # Build param_groups with all required fields explicit
@@ -433,7 +435,7 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * output_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * emb_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * emb_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * ve_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),

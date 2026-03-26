@@ -281,26 +281,42 @@ def setup_optimizer_sp(model: GPT, config: CoordCheckConfig, width: int):
 
 
 def record_detailed_stats(model: GPT, results: Dict, width: int, step: int):
-    """Record weight update norms and gradient norms per parameter group."""
+    """Record weight update norms, gradient norms, and spectral norms per parameter group."""
     for name, p in model.named_parameters():
         if p.grad is None:
             continue
         # Simplify name for display
         short_name = name.replace('transformer.', '').replace('.weight', '')
-        # Gradient norm
+        # Gradient Frobenius norm
         grad_norm = p.grad.float().norm().item()
         results['detailed_stats'][width][f'grad norm: {short_name}'].append(grad_norm)
+        # Gradient spectral norm (top singular value) — only for 2D weight matrices
+        if p.grad.ndim == 2:
+            try:
+                # svd_lowrank is faster than full SVD when we only need the top singular value
+                U, S, V = torch.svd_lowrank(p.grad.float(), q=1)
+                results['detailed_stats'][width][f'grad spectral: {short_name}'].append(S[0].item())
+            except Exception:
+                pass
 
 
 def record_weight_update_norms(model: GPT, params_before: Dict[str, torch.Tensor],
                                 results: Dict, width: int):
-    """Record ||delta_W|| for each parameter after optimizer step."""
+    """Record ||delta_W|| (Frobenius) and spectral norm of delta_W for each parameter after optimizer step."""
     for name, p in model.named_parameters():
         if name not in params_before:
             continue
         short_name = name.replace('transformer.', '').replace('.weight', '')
-        delta = (p.data.float() - params_before[name]).norm().item()
-        results['detailed_stats'][width][f'update norm: {short_name}'].append(delta)
+        delta = p.data.float() - params_before[name]
+        # Frobenius norm of update
+        results['detailed_stats'][width][f'update norm: {short_name}'].append(delta.norm().item())
+        # Spectral norm of update — only for 2D weight matrices
+        if delta.ndim == 2:
+            try:
+                U, S, V = torch.svd_lowrank(delta, q=1)
+                results['detailed_stats'][width][f'update spectral: {short_name}'].append(S[0].item())
+            except Exception:
+                pass
 
 
 def run_coord_check(config: CoordCheckConfig, device: torch.device,
@@ -558,8 +574,12 @@ def plot_detailed(results: Dict, config: CoordCheckConfig, save_path: Optional[s
     # Group by category
     categories = defaultdict(list)
     for name in metric_names:
-        if name.startswith('grad norm:'):
+        if name.startswith('grad spectral:'):
+            categories['Gradient Spectral Norms'].append(name)
+        elif name.startswith('grad norm:'):
             categories['Gradient Norms'].append(name)
+        elif name.startswith('update spectral:'):
+            categories['Update Spectral Norms'].append(name)
         elif name.startswith('update norm:'):
             categories['Weight Update Norms'].append(name)
         elif name.startswith('attn logits'):
@@ -607,6 +627,77 @@ def plot_detailed(results: Dict, config: CoordCheckConfig, save_path: Optional[s
         plt.show()
 
 
+def plot_spectral_vs_width(results: Dict, config: CoordCheckConfig, save_path: Optional[str] = None):
+    """Plot spectral norms vs width (like coord check plots) to verify width-independence.
+
+    For each 2D weight matrix, plots the spectral norm of its gradient and update
+    at the final training step as a function of model width. Under correct muP/CompleteP
+    scaling, these should be flat (width-independent), indicating feature learning
+    in all layers. Growing spectral norms indicate lazy/NTK-like behavior.
+    """
+    widths = results['widths']
+    detailed = results['detailed_stats']
+    if not detailed or not detailed[widths[0]]:
+        print("No detailed stats recorded. Use --detailed flag.")
+        return
+
+    # Collect spectral metrics
+    spectral_categories = {
+        'Gradient Spectral Norms vs Width': [n for n in sorted(detailed[widths[0]].keys()) if n.startswith('grad spectral:')],
+        'Update Spectral Norms vs Width': [n for n in sorted(detailed[widths[0]].keys()) if n.startswith('update spectral:')],
+    }
+
+    for cat_name, names in spectral_categories.items():
+        if not names:
+            continue
+        n = len(names)
+        n_cols = min(4, n)
+        n_rows = (n + n_cols - 1) // n_cols
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3 * n_rows))
+        if n == 1:
+            axes = np.array([axes])
+        axes = np.array(axes).flatten()
+
+        steps = results['steps']
+        step_colors = plt.cm.plasma(np.linspace(0, 1, len(steps)))
+
+        for i, name in enumerate(names):
+            ax = axes[i]
+            for step_idx, step in enumerate(steps):
+                values = []
+                for w in widths:
+                    step_vals = detailed[w].get(name, [])
+                    if step_idx < len(step_vals):
+                        values.append(step_vals[step_idx])
+                    else:
+                        values.append(np.nan)
+                ax.plot(np.log2(widths), values, 'o-', color=step_colors[step_idx],
+                        linewidth=1.2, markersize=4,
+                        label=f'step {step}' if i == 0 else None)
+            short_name = name.split(': ', 1)[-1] if ': ' in name else name
+            ax.set_title(short_name, fontsize=8)
+            ax.set_xlabel('log2(width)')
+            ax.set_ylabel('Spectral Norm')
+            ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
+
+        for i in range(n, len(axes)):
+            axes[i].set_visible(False)
+
+        axes[0].legend(fontsize=6, loc='best', ncol=2)
+        param_type = "muP" if config.use_mup else "SP"
+        fig.suptitle(f'{cat_name} ({param_type}) — flat = width-independent (good)', fontsize=12)
+        plt.tight_layout()
+
+        if save_path:
+            cat_slug = cat_name.lower().replace(' ', '_').replace(' ', '_')
+            path = save_path.replace('.png', f'_{cat_slug}.png')
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            print(f"Saved {cat_name} plot to {path}")
+
+        plt.show()
+
+
 def compute_width_dependence(results: Dict) -> Dict[str, float]:
     """Compute how much activations scale with width (slope on log-log plot)."""
     widths = np.array(results['widths'])
@@ -619,6 +710,39 @@ def compute_width_dependence(results: Dict) -> Dict[str, float]:
         log_values = np.log2(np.array(values) + 1e-10)
         slope, _ = np.polyfit(log_widths, log_values, 1)
         slopes[layer] = slope
+
+    return slopes
+
+
+def compute_spectral_width_dependence(results: Dict) -> Dict[str, float]:
+    """Compute how spectral norms scale with width (slope on log-log plot).
+
+    For correct muP/CompleteP, spectral norms of gradients and updates should
+    be width-independent (slope ~0), indicating feature learning in all layers.
+    Positive slopes suggest lazy/NTK behavior where features don't evolve.
+    """
+    widths = np.array(results['widths'])
+    log_widths = np.log2(widths)
+    detailed = results.get('detailed_stats', {})
+    if not detailed or not detailed[widths[0]]:
+        return {}
+
+    spectral_names = [n for n in sorted(detailed[widths[0]].keys())
+                      if 'spectral' in n]
+
+    slopes = {}
+    for name in spectral_names:
+        values = []
+        for w in widths:
+            step_vals = detailed[w].get(name, [])
+            # Use the final step value
+            values.append(step_vals[-1] if step_vals else np.nan)
+        values = np.array(values)
+        if np.any(np.isnan(values)) or np.any(values <= 0):
+            continue
+        log_values = np.log2(values)
+        slope, _ = np.polyfit(log_widths, log_values, 1)
+        slopes[name] = slope
 
     return slopes
 
@@ -714,6 +838,23 @@ def main():
         for layer in slopes_sp:
             print(f"{layer:<20} {slopes_sp[layer]:>12.4f} {slopes_mup[layer]:>12.4f}")
 
+        # Spectral norm width dependence (if --detailed)
+        if config.detailed:
+            spectral_slopes_sp = compute_spectral_width_dependence(results_sp)
+            spectral_slopes_mup = compute_spectral_width_dependence(results_mup)
+            if spectral_slopes_sp:
+                print(f"\n{'='*60}")
+                print("Spectral Norm Width Dependence (slope on log-log plot)")
+                print("Expected: ~0 for feature learning, positive = lazy/NTK regime")
+                print("="*60)
+                print(f"\n{'Parameter':<30} {'SP Slope':>12} {'muP Slope':>12}")
+                print("-"*56)
+                for name in spectral_slopes_sp:
+                    short = name.split(': ', 1)[-1] if ': ' in name else name
+                    sp_val = spectral_slopes_sp.get(name, float('nan'))
+                    mup_val = spectral_slopes_mup.get(name, float('nan'))
+                    print(f"{short:<30} {sp_val:>12.4f} {mup_val:>12.4f}")
+
         # Plot comparison
         save_path = None
         if args.save_dir:
@@ -726,9 +867,12 @@ def main():
             for results, label in [(results_sp, 'SP'), (results_mup, 'muP')]:
                 config.use_mup = (label == 'muP')
                 detail_save = None
+                spectral_save = None
                 if args.save_dir:
                     detail_save = os.path.join(args.save_dir, f'detailed_{label.lower()}.png')
+                    spectral_save = os.path.join(args.save_dir, f'spectral_{label.lower()}.png')
                 plot_detailed(results, config, detail_save)
+                plot_spectral_vs_width(results, config, spectral_save)
 
     else:
         # Run single mode
@@ -754,6 +898,19 @@ def main():
             status = "OK" if abs(slope) < 0.1 else "WARN"
             print(f"  {layer}: {slope:+.4f} [{status}]")
 
+        # Spectral norm width dependence (if --detailed)
+        if config.detailed:
+            spectral_slopes = compute_spectral_width_dependence(results)
+            if spectral_slopes:
+                print("\n" + "="*60)
+                print("Spectral Norm Width Dependence (slope on log-log plot)")
+                print("Expected: ~0 for feature learning, positive = lazy/NTK regime")
+                print("="*60)
+                for name, slope in spectral_slopes.items():
+                    short = name.split(': ', 1)[-1] if ': ' in name else name
+                    status = "OK" if abs(slope) < 0.1 else "WARN"
+                    print(f"  {short}: {slope:+.4f} [{status}]")
+
         # Loss curve analysis
         final_losses = [results['losses'][w][-1] for w in results['widths']]
         loss_spread = max(final_losses) - min(final_losses)
@@ -776,9 +933,12 @@ def main():
         # Plot detailed diagnostics if requested
         if config.detailed:
             detail_save = None
+            spectral_save = None
             if args.save_dir:
                 detail_save = os.path.join(args.save_dir, f'detailed_{param_type.lower()}.png')
+                spectral_save = os.path.join(args.save_dir, f'spectral_{param_type.lower()}.png')
             plot_detailed(results, config, detail_save)
+            plot_spectral_vs_width(results, config, spectral_save)
 
 
 if __name__ == '__main__':

@@ -44,6 +44,7 @@ class GPTConfig:
     attn_temp: float = 1.44     # QK scaling temperature (currently 1.2*1.2=1.44 split between Q and K)
     emb_mult: float = 1.0       # scalar after embedding norm (before transformer blocks)
     output_temp: float = 1.0    # scalar on logits before softcap
+    ve_init_std: float = 0.10   # embedding-style init for value embeds; calibrated to be a modest correction to c_v
 
 
 def norm(x):
@@ -254,9 +255,10 @@ class GPT(nn.Module):
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Value embeddings (init like c_v: uniform with same std)
+        # Value embeddings are lookup tables, not fan-in projections like c_v.
+        # Use an embedding-style constant std and let the gate keep this path as a correction.
         for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+            torch.nn.init.normal_(ve.weight, mean=0.0, std=self.config.ve_init_std)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
@@ -435,7 +437,7 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * output_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * emb_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * ve_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * ve_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),

@@ -42,6 +42,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import os
+import math
 
 from nanochat.gpt import GPT, GPTConfig
 
@@ -73,6 +74,11 @@ class TransferCheckConfig:
     # "all" = multiply all LRs (default), "muon-only" = only matrix_lr,
     # "adamw-only" = only embedding_lr/unembedding_lr
     sweep_mode: str = "all"
+    # Multi-seed averaging (EleutherAI uses 3)
+    num_seeds: int = 1
+    base_seed: int = 42
+    # LR decay (EleutherAI uses cosine decay to lr/10 over training)
+    lr_decay: bool = False
 
 
 def load_batches(num_batches: int, batch_size: int, seq_len: int, device: torch.device):
@@ -169,11 +175,22 @@ def train_model(width: int, lr_mult: float, config: TransferCheckConfig,
         muon_lr_exponent=config.muon_lr_exponent,
     )
 
+    # Cosine LR decay schedule (EleutherAI: decay to lr/10 over training)
+    base_lrs = [pg['lr'] for pg in optimizer.param_groups]
+    min_lr_ratio = 0.1  # decay to 10% of peak LR
+
     model.train()
     losses = []
     num_batches = len(batches)
 
     for step in range(config.num_steps):
+        # Apply cosine LR decay if enabled
+        if config.lr_decay:
+            progress = step / max(config.num_steps - 1, 1)
+            decay = min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
+            for pg, base_lr in zip(optimizer.param_groups, base_lrs):
+                pg['lr'] = base_lr * decay
+
         x, y = batches[step % num_batches]
         with torch.amp.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
             loss = model(x, y)
@@ -190,25 +207,50 @@ def train_model(width: int, lr_mult: float, config: TransferCheckConfig,
     return losses, actual_width
 
 
+def ewm_final(losses: List[float], alpha: float = 0.9) -> float:
+    """Compute exponentially weighted moving average and return final value."""
+    ewm = losses[0]
+    for loss in losses[1:]:
+        ewm = alpha * loss + (1 - alpha) * ewm
+    return ewm
+
+
 def run_transfer_check(config: TransferCheckConfig, device: torch.device,
                        batches: List) -> Dict:
-    """Run LR sweep across all widths."""
+    """Run LR sweep across all widths, averaging over multiple seeds."""
+    seeds = list(range(config.base_seed, config.base_seed + config.num_seeds))
     results = {
         'widths': [],
         'lr_multipliers': config.lr_multipliers,
-        'losses': {},  # losses[(width, lr_mult)] = [loss_step0, ...]
-        'final_losses': defaultdict(dict),  # final_losses[width][lr_mult] = final_loss
+        'losses': {},  # losses[(width, lr_mult)] = mean loss curve across seeds
+        'final_losses': defaultdict(dict),  # final_losses[width][lr_mult] = mean EWM final loss
+        'final_losses_stderr': defaultdict(dict),  # stderr across seeds
     }
 
     for width in config.widths:
         actual_width = None
+        seed_label = f" (seeds {seeds[0]}-{seeds[-1]})" if len(seeds) > 1 else ""
         for lr_mult in config.lr_multipliers:
-            print(f"  width={width}, lr_mult={lr_mult:.4f}...", end=" ", flush=True)
+            print(f"  width={width}, lr_mult={lr_mult:.4f}...{seed_label}", end=" ", flush=True)
 
-            losses, actual_width = train_model(width, lr_mult, config, device, batches)
-            results['losses'][(actual_width, lr_mult)] = losses
-            results['final_losses'][actual_width][lr_mult] = losses[-1]
-            print(f"final_loss={losses[-1]:.4f}")
+            seed_ewm_losses = []
+            seed_loss_curves = []
+            for seed in seeds:
+                config_copy_seed = config.seed
+                config.seed = seed
+                losses, actual_width = train_model(width, lr_mult, config, device, batches)
+                config.seed = config_copy_seed
+                seed_loss_curves.append(losses)
+                seed_ewm_losses.append(ewm_final(losses))
+
+            mean_ewm = np.mean(seed_ewm_losses)
+            stderr_ewm = np.std(seed_ewm_losses, ddof=1) / np.sqrt(len(seeds)) if len(seeds) > 1 else 0.0
+            mean_curve = np.mean(seed_loss_curves, axis=0).tolist()
+
+            results['losses'][(actual_width, lr_mult)] = mean_curve
+            results['final_losses'][actual_width][lr_mult] = mean_ewm
+            results['final_losses_stderr'][actual_width][lr_mult] = stderr_ewm
+            print(f"final_loss={mean_ewm:.4f}" + (f" ± {stderr_ewm:.4f}" if len(seeds) > 1 else ""))
 
         if actual_width not in results['widths']:
             results['widths'].append(actual_width)
@@ -271,6 +313,9 @@ def plot_lr_sweep(results: Dict, config: TransferCheckConfig, title: str = "", s
 
     ax.set_xscale('log', base=2)
     ax.set_yscale('log')
+    # Cap y-axis at 3x the best loss so high-LR blowups don't hog the axis
+    all_losses = [final_losses[w][m] for m in lr_mults for w in widths]
+    ax.set_ylim(min(all_losses) * 0.9, min(all_losses) * 3.0)
     ax.set_xlabel('LR Multiplier')
     ax.set_ylabel('Final Loss')
     ax.set_title(f'LR Sweep{" - " + title if title else ""}')
@@ -312,8 +357,13 @@ def plot_comparison(results_sp: Dict, results_mup: Dict, config: TransferCheckCo
     for col, (results, label) in enumerate([(results_sp, 'SP'), (results_mup, 'muP')]):
         ax = axes[0, col]
         for i, w in enumerate(widths):
-            losses = [results['final_losses'][w][m] for m in lr_mults]
+            losses = np.array([results['final_losses'][w][m] for m in lr_mults])
             ax.plot(lr_mults, losses, 'o-', color=colors[i], linewidth=2, label=f'w={w}')
+            # Add stderr bands if available
+            if 'final_losses_stderr' in results and w in results['final_losses_stderr']:
+                stderrs = np.array([results['final_losses_stderr'][w].get(m, 0) for m in lr_mults])
+                if stderrs.any():
+                    ax.fill_between(lr_mults, losses - stderrs, losses + stderrs, color=colors[i], alpha=0.2)
             opt_mult = find_optimal_lr(results['final_losses'][w])
             opt_loss = results['final_losses'][w][opt_mult]
             ax.plot(opt_mult, opt_loss, '*', color=colors[i], markersize=15, zorder=5)
@@ -325,10 +375,11 @@ def plot_comparison(results_sp: Dict, results_mup: Dict, config: TransferCheckCo
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    # Shared y-axis for top row
+    # Shared y-axis for top row — cap at 3x the best loss so high-LR blowups don't hog the axis
     all_losses_flat = [results_sp['final_losses'][w][m] for m in lr_mults for w in widths] + \
                       [results_mup['final_losses'][w][m] for m in lr_mults for w in widths]
-    y_min, y_max = min(all_losses_flat) * 0.9, max(all_losses_flat) * 1.1
+    y_min = min(all_losses_flat) * 0.9
+    y_max = min(all_losses_flat) * 3.0  # cap: show up to 3x the best loss
     axes[0, 0].set_ylim(y_min, y_max)
     axes[0, 1].set_ylim(y_min, y_max)
 
@@ -523,6 +574,10 @@ def main():
                         help='Which optimizer groups the LR multiplier applies to: '
                              '"all" = all LRs (default), "muon-only" = only Muon/matrix LR, '
                              '"adamw-only" = only AdamW/embedding/output LR')
+    parser.add_argument('--seeds', type=int, default=1,
+                        help='Number of seeds to average over (EleutherAI uses 3)')
+    parser.add_argument('--lr-decay', action='store_true',
+                        help='Enable cosine LR decay to lr/10 (EleutherAI OWT style)')
 
     args = parser.parse_args()
 
@@ -561,6 +616,9 @@ def main():
         num_batches=args.num_batches,
         muon_lr_exponent=args.muon_lr_exponent,
         sweep_mode=args.sweep_mode,
+        num_seeds=args.seeds,
+        base_seed=args.seed,
+        lr_decay=args.lr_decay,
     )
 
     if args.compare:

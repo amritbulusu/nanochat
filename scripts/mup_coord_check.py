@@ -78,6 +78,8 @@ class CoordCheckConfig:
     # Muon LR exponent: 1.0 = base/width (standard muP), 0.5 = sqrt(base/width)
     # Paper Section C.1: Frobenius-normalizing optimizers may need exponent 0.5
     muon_lr_exponent: float = 0.0
+    num_seeds: int = 1
+    base_seed: int = 42
 
 
 class ActivationRecorder:
@@ -87,6 +89,8 @@ class ActivationRecorder:
         self.stats: Dict[str, List[float]] = defaultdict(list)
         self.hooks = []
         self.detailed = detailed
+        self._last_q = None
+        self._ve_cache: Dict[int, torch.Tensor] = {}
 
     def _get_stat(self, tensor: torch.Tensor) -> float:
         """Compute mean absolute value (l1 norm per element)."""
@@ -111,9 +115,6 @@ class ActivationRecorder:
         We hook onto c_k's forward, then use the most recent c_q output to compute
         q @ k^T / sqrt(d) for a single batch element to measure attention logit scale.
         """
-        # We'll store q output and compute logits when k is available
-        self._last_q = None
-
         def q_hook(module, input, output):
             self._last_q = output.detach()
 
@@ -149,6 +150,35 @@ class ActivationRecorder:
 
         # Each transformer block
         for i, block in enumerate(model.transformer.h):
+            if str(i) in model.value_embeds:
+                n_kv_head = block.attn.n_kv_head
+                head_dim = block.attn.head_dim
+
+                def ve_hook(module, input, output, layer=i):
+                    if output is not None and isinstance(output, torch.Tensor):
+                        self.stats[f'value embed.{layer}'].append(self._get_stat(output))
+                        self._ve_cache[layer] = output.detach()
+
+                def c_v_hook(module, input, output, layer=i):
+                    if output is not None and isinstance(output, torch.Tensor):
+                        self.stats[f'value current.{layer}'].append(self._get_stat(output))
+
+                def gate_hook(module, input, output, layer=i, n_kv_head=n_kv_head, head_dim=head_dim):
+                    if output is None or not isinstance(output, torch.Tensor):
+                        return
+                    gate = 3 * torch.sigmoid(output.detach())
+                    self.stats[f'value gate.{layer}'].append(self._get_stat(gate))
+                    ve = self._ve_cache.pop(layer, None)
+                    if ve is None:
+                        return
+                    ve = ve.view(ve.shape[0], ve.shape[1], n_kv_head, head_dim)
+                    branch = gate.unsqueeze(-1) * ve
+                    self.stats[f'value branch.{layer}'].append(self._get_stat(branch))
+
+                self.hooks.append(model.value_embeds[str(i)].register_forward_hook(ve_hook))
+                self.hooks.append(block.attn.c_v.register_forward_hook(c_v_hook))
+                self.hooks.append(block.attn.ve_gate.register_forward_hook(gate_hook))
+
             # Attention output
             h = block.attn.c_proj.register_forward_hook(self._make_hook(f'attn output.{i}'))
             self.hooks.append(h)
@@ -184,6 +214,8 @@ class ActivationRecorder:
         for h in self.hooks:
             h.remove()
         self.hooks = []
+        self._ve_cache = {}
+        self._last_q = None
 
     def get_step_stats(self) -> Dict[str, float]:
         """Get mean stats for the current step and reset."""
@@ -192,6 +224,8 @@ class ActivationRecorder:
             if values:
                 step_stats[name] = np.mean(values)
         self.stats = defaultdict(list)
+        self._ve_cache = {}
+        self._last_q = None
         return step_stats
 
 
@@ -271,70 +305,95 @@ def record_weight_update_norms(model: GPT, params_before: Dict[str, torch.Tensor
 
 def run_coord_check(config: CoordCheckConfig, device: torch.device,
                     x: torch.Tensor, y: torch.Tensor) -> Dict:
-    """Run coordinate check across all widths."""
+    """Run coordinate check across all widths, averaging over multiple seeds."""
+    seeds = list(range(config.base_seed, config.base_seed + config.num_seeds))
     results = {
         'widths': [],
         'steps': list(range(config.num_steps)),
-        'stats': defaultdict(lambda: defaultdict(list)),
+        'stats': defaultdict(lambda: defaultdict(list)),       # mean across seeds
+        'stats_stderr': defaultdict(lambda: defaultdict(list)), # stderr across seeds
         'losses': defaultdict(list),
         'detailed_stats': defaultdict(lambda: defaultdict(list)),
     }
 
     for width in config.widths:
-        print(f"\nTraining width={width}...")
-
-        torch.manual_seed(config.seed)
+        seed_label = f" (seeds {seeds[0]}-{seeds[-1]})" if len(seeds) > 1 else ""
+        print(f"\nTraining width={width}...{seed_label}")
 
         mup_base_width = config.base_width if config.use_mup else 0
-        model, gpt_config = create_model(width, config, device, mup_base_width=mup_base_width)
-        actual_width = gpt_config.n_embd
+
+        # Collect stats across seeds: {layer: [[step0, step1, ...], ...per seed]}
+        seed_stats = defaultdict(list)
+        seed_losses = []
+
+        for seed_idx, seed in enumerate(seeds):
+            torch.manual_seed(seed)
+
+            model, gpt_config = create_model(width, config, device, mup_base_width=mup_base_width)
+            actual_width = gpt_config.n_embd
+
+            if config.use_mup:
+                optimizer = setup_optimizer_mup(model, config, actual_width)
+            else:
+                optimizer = setup_optimizer_sp(model, config, actual_width)
+
+            recorder = ActivationRecorder(detailed=config.detailed)
+            recorder.register_hooks(model)
+            model.train()
+
+            step_values = defaultdict(list)
+            losses = []
+
+            for step in range(config.num_steps):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
+                    loss = model(x, y)
+
+                losses.append(loss.item())
+                step_stats = recorder.get_step_stats()
+                for layer, value in step_stats.items():
+                    step_values[layer].append(value)
+
+                if step == 0 and seed_idx == 0:
+                    print(f"  Step {step}: loss={loss.item():.4f}, layers={list(step_stats.keys())}")
+
+                loss.backward()
+
+                if config.detailed:
+                    record_detailed_stats(model, results, actual_width, step)
+                    params_before = {name: p.data.float().clone()
+                                     for name, p in model.named_parameters()
+                                     if p.grad is not None}
+
+                optimizer.step()
+
+                if config.detailed:
+                    record_weight_update_norms(model, params_before, results, actual_width)
+
+                optimizer.zero_grad(set_to_none=True)
+
+            seed_losses.append(losses)
+            for layer, vals in step_values.items():
+                seed_stats[layer].append(vals)
+
+            recorder.remove_hooks()
+            del model, optimizer
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
         results['widths'].append(actual_width)
 
-        if config.use_mup:
-            optimizer = setup_optimizer_mup(model, config, actual_width)
-        else:
-            optimizer = setup_optimizer_sp(model, config, actual_width)
+        # Average across seeds
+        mean_losses = np.mean(seed_losses, axis=0).tolist()
+        results['losses'][actual_width] = mean_losses
 
-        recorder = ActivationRecorder(detailed=config.detailed)
-        recorder.register_hooks(model)
+        for layer, all_seed_vals in seed_stats.items():
+            arr = np.array(all_seed_vals)  # (num_seeds, num_steps)
+            means = arr.mean(axis=0).tolist()
+            stderrs = (arr.std(axis=0, ddof=1) / np.sqrt(len(seeds))).tolist() if len(seeds) > 1 else [0.0] * len(means)
+            results['stats'][actual_width][layer] = means
+            results['stats_stderr'][actual_width][layer] = stderrs
 
-        model.train()
-
-        for step in range(config.num_steps):
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float32, enabled=False):
-                loss = model(x, y)
-
-            results['losses'][actual_width].append(loss.item())
-
-            step_stats = recorder.get_step_stats()
-            for layer, value in step_stats.items():
-                results['stats'][actual_width][layer].append(value)
-
-            if step == 0:
-                print(f"  Step {step}: loss={loss.item():.4f}, layers={list(step_stats.keys())}")
-
-            # Record gradient norms before step (detailed mode)
-            loss.backward()
-
-            if config.detailed:
-                record_detailed_stats(model, results, actual_width, step)
-                # Snapshot params before optimizer step to compute update norms
-                params_before = {name: p.data.float().clone()
-                                 for name, p in model.named_parameters()
-                                 if p.grad is not None}
-
-            optimizer.step()
-
-            if config.detailed:
-                record_weight_update_norms(model, params_before, results, actual_width)
-
-            optimizer.zero_grad(set_to_none=True)
-
-        print(f"  Final loss: {loss.item():.4f}")
-
-        recorder.remove_hooks()
-        del model, optimizer
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        final_losses = [sl[-1] for sl in seed_losses]
+        print(f"  Final loss: {np.mean(final_losses):.4f}" + (f" ± {np.std(final_losses, ddof=1)/np.sqrt(len(seeds)):.4f}" if len(seeds) > 1 else ""))
 
     return results
 
@@ -585,7 +644,9 @@ def main():
     parser.add_argument('--save-dir', type=str, default=None,
                         help='Directory to save plots')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Random seed')
+                        help='Base random seed')
+    parser.add_argument('--seeds', type=int, default=1,
+                        help='Number of seeds to average over (EleutherAI uses 5)')
     parser.add_argument('--detailed', action='store_true',
                         help='Record detailed diagnostics: gradient norms, weight update norms, '
                              'attention logit magnitudes')
@@ -619,6 +680,8 @@ def main():
         base_width=args.base_width,
         detailed=args.detailed,
         muon_lr_exponent=args.muon_lr_exponent,
+        num_seeds=args.seeds,
+        base_seed=args.seed,
     )
 
     if args.compare:

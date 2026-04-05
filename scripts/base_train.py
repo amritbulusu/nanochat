@@ -69,6 +69,9 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--use-mup", action="store_true", help="use muP (Maximal Update Parameterization) LR scaling")
 parser.add_argument("--base-width", type=int, default=256, help="base width for muP LR scaling (LRs tuned at this width)")
+parser.add_argument("--use-completep", action="store_true", help="use CompleteP depth parameterization (branch scaling)")
+parser.add_argument("--base-depth", type=int, default=0, help="base depth for CompleteP (0 = same as --depth)")
+parser.add_argument("--depth-branch-alpha", type=float, default=1.0, help="CompleteP branch scaling exponent (1.0=CompleteP, 0.5=Depth-muP)")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
@@ -140,6 +143,8 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         mup_base_width=args.base_width if args.use_mup else 0,
+        completep_base_depth=(args.base_depth if args.base_depth > 0 else depth) if args.use_completep else 0,
+        depth_branch_alpha=args.depth_branch_alpha,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

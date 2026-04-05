@@ -45,6 +45,11 @@ class GPTConfig:
     emb_mult: float = 1.0       # scalar after embedding norm (before transformer blocks)
     output_temp: float = 1.0    # scalar on logits before softcap
     ve_init_std: float = 0.10   # embedding-style init for value embeds; calibrated to be a modest correction to c_v
+    # CompleteP (depth parameterization): set > 0 to enable. Value is the base/proxy depth.
+    # Scales each residual branch output by (base_depth/n_layer)^alpha before adding to residual stream.
+    # See arXiv:2505.01618 (CompleteP) and arXiv:2512.22382 (CompletedP).
+    completep_base_depth: int = 0
+    depth_branch_alpha: float = 1.0  # 1.0 = CompleteP, 0.5 = Depth-muP
 
 
 def norm(x):
@@ -154,9 +159,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, branch_scale=1.0):
+        x = x + branch_scale * self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + branch_scale * self.mlp(norm(x))
         return x
 
 
@@ -249,11 +254,21 @@ class GPT(nn.Module):
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
         n_layer = self.config.n_layer
-        for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
+        if self.config.completep_base_depth > 0:
+            # Under CompleteP, resid_lambdas must be 1.0 to avoid exponential depth amplification.
+            # Values > 1.0 compound multiplicatively: product ≈ 1.1^L, breaking depth independence.
+            self.resid_lambdas.data[:] = 1.0
+        else:
+            for i in range(n_layer):
+                self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
         # Decaying x0 init: earlier layers get more input embedding blending
+        # CompleteP: scale x0 injection to match branch budget (O(1/L) per layer)
+        x0_depth_scale = 1.0
+        if self.config.completep_base_depth > 0:
+            m_L = n_layer / self.config.completep_base_depth
+            x0_depth_scale = m_L ** (-self.config.depth_branch_alpha)
         for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+            self.x0_lambdas.data[i] = (0.20 - (0.15 * i / max(n_layer - 1, 1))) * x0_depth_scale
 
         # Value embeddings are lookup tables, not fan-in projections like c_v.
         # Use an embedding-style constant std and let the gate keep this path as a correction.
@@ -498,10 +513,16 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # CompleteP: scale each residual branch by (base_depth/n_layer)^alpha
+        if self.config.completep_base_depth > 0:
+            m_L = n_layer / self.config.completep_base_depth
+            branch_scale = m_L ** (-self.config.depth_branch_alpha)
+        else:
+            branch_scale = 1.0
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, branch_scale=branch_scale)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
